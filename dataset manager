@@ -2,6 +2,15 @@ import os
 import sys
 import shutil
 from typing import Dict, List, Optional, Tuple, Set
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class DeletionOp:
+    class_index: int
+    mode: str  # "single" | "overlap-any" | "overlap-specific" | "any"
+    n: int
+    delete_images_too: bool
+    overlap_with_index: Optional[int] = None
 
 from PySide6.QtCore import Qt, QPoint
 from PySide6.QtWidgets import (
@@ -117,6 +126,7 @@ class YoloDatasetModel:
         # Deletion plan (affects OUTPUT only)
         self.delete_rel_labels: Set[str] = set()
         self.delete_rel_images: Set[str] = set()
+        self.deletion_ops: List[DeletionOp] = []
 
     def load_input(self, dataset_root: str) -> None:
         dataset_root = os.path.abspath(dataset_root)
@@ -369,6 +379,7 @@ class YoloDatasetModel:
     def clear_deletion_plan(self) -> None:
         self.delete_rel_labels.clear()
         self.delete_rel_images.clear()
+        self.deletion_ops.clear()
 
     # ---------- apply ----------
     def apply_to_output(self, copy_non_label_files: bool) -> Tuple[int, int, int, int, int, List[str]]:
@@ -683,6 +694,23 @@ class ManageSamplesDialog(QDialog):
             QMessageBox.information(self, "Nothing to add", "No candidates match the selected filter.")
             return
 
+        mode_txt = "single" if self.rb_single.isChecked() else \
+                   "overlap-any" if self.rb_overlap_any.isChecked() else \
+                   "overlap-specific" if self.rb_overlap_specific.isChecked() else "any"
+
+        overlap_idx = None
+        if mode_txt == "overlap-specific" and self.cmb_overlap.currentIndex() >= 0:
+            overlap_idx = int(self.cmb_overlap.currentData())
+
+        op = DeletionOp(
+            class_index=self.class_index,
+            mode=mode_txt,
+            n=self.spin_n.value(),
+            delete_images_too=(self.cmb_delete_kind.currentIndex() == 1),
+            overlap_with_index=overlap_idx
+        )
+        self.model.deletion_ops.append(op)
+
         delete_images_too = (self.cmb_delete_kind.currentIndex() == 1)
 
         labels_added = 0
@@ -826,16 +854,12 @@ class MainWindow(QMainWindow):
         gb_warn_lay.addWidget(self.lbl_warn)
 
         # --- Deletion plan panel ---
-        gb_plan = QGroupBox("Deletion plan (OUTPUT changes)")
+        gb_plan = QGroupBox("Deletion plan (summary)")
         gb_plan_lay = QVBoxLayout(gb_plan)
-        right_lay.addWidget(gb_plan, 1)
+        right_lay.addWidget(gb_plan, 0)
 
         plan_top = QHBoxLayout()
         gb_plan_lay.addLayout(plan_top)
-
-        self.btn_plan_remove_selected = QPushButton("Remove selected from plan")
-        self.btn_plan_remove_selected.clicked.connect(self.on_plan_remove_selected)
-        plan_top.addWidget(self.btn_plan_remove_selected)
 
         self.btn_plan_clear = QPushButton("Clear plan")
         self.btn_plan_clear.clicked.connect(self.on_plan_clear)
@@ -843,32 +867,10 @@ class MainWindow(QMainWindow):
 
         plan_top.addStretch(1)
 
-        # Two lists side by side: labels + images
-        plan_split = QSplitter(Qt.Horizontal)
-        gb_plan_lay.addWidget(plan_split, 1)
-
-        plan_left = QWidget()
-        plan_left_lay = QVBoxLayout(plan_left)
-        plan_left_lay.setContentsMargins(0, 0, 0, 0)
-        plan_split.addWidget(plan_left)
-
-        plan_right = QWidget()
-        plan_right_lay = QVBoxLayout(plan_right)
-        plan_right_lay.setContentsMargins(0, 0, 0, 0)
-        plan_split.addWidget(plan_right)
-
-        plan_left_lay.addWidget(QLabel("Labels to delete/skip:"))
-        self.list_plan_labels = QListWidget()
-        self.list_plan_labels.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        plan_left_lay.addWidget(self.list_plan_labels, 1)
-
-        plan_right_lay.addWidget(QLabel("Images to delete (if selected):"))
-        self.list_plan_images = QListWidget()
-        self.list_plan_images.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        plan_right_lay.addWidget(self.list_plan_images, 1)
-
-        plan_split.setStretchFactor(0, 1)
-        plan_split.setStretchFactor(1, 1)
+        self.plan_table = QTableWidget(0, 5)
+        self.plan_table.setHorizontalHeaderLabels(["Class", "Mode", "N", "Type", "Overlap-with"])
+        self.plan_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        gb_plan_lay.addWidget(self.plan_table)
 
         self.set_enabled(False)
 
@@ -877,8 +879,7 @@ class MainWindow(QMainWindow):
             self.class_list, self.btn_rename, self.btn_up, self.btn_down,
             self.btn_merge, self.btn_delete, self.btn_refresh, self.btn_pdf,
             self.btn_apply, self.btn_out, self.chk_copy,
-            self.btn_plan_remove_selected, self.btn_plan_clear,
-            self.list_plan_labels, self.list_plan_images
+            self.btn_plan_clear, self.plan_table
         ]:
             w.setEnabled(on)
 
@@ -925,15 +926,32 @@ class MainWindow(QMainWindow):
         self.refresh_deletion_plan_view()
 
     def refresh_deletion_plan_view(self):
-        # Labels
-        self.list_plan_labels.clear()
-        for rel in sorted(self.model.delete_rel_labels):
-            self.list_plan_labels.addItem(QListWidgetItem(rel))
+        ops = self.model.deletion_ops
+        self.plan_table.setRowCount(len(ops))
 
-        # Images
-        self.list_plan_images.clear()
-        for rel in sorted(self.model.delete_rel_images):
-            self.list_plan_images.addItem(QListWidgetItem(rel))
+        # to resolve names for display
+        classes = {idx: name for idx, name in self.model.get_classes()}
+
+        def mode_pretty(m: str) -> str:
+            return {
+                "single": "Single-class",
+                "overlap-any": "Overlap (any)",
+                "overlap-specific": "Overlap (specific)",
+                "any": "Any containing class",
+            }.get(m, m)
+
+        for r, op in enumerate(ops):
+            cls_name = classes.get(op.class_index, f"#{op.class_index}")
+            self.plan_table.setItem(r, 0, QTableWidgetItem(f"{op.class_index}: {cls_name}"))
+            self.plan_table.setItem(r, 1, QTableWidgetItem(mode_pretty(op.mode)))
+            self.plan_table.setItem(r, 2, QTableWidgetItem(str(op.n)))
+            self.plan_table.setItem(r, 3, QTableWidgetItem("Labels+Images" if op.delete_images_too else "Labels only"))
+
+            if op.mode == "overlap-specific" and op.overlap_with_index is not None:
+                other_name = classes.get(op.overlap_with_index, f"#{op.overlap_with_index}")
+                self.plan_table.setItem(r, 4, QTableWidgetItem(f"{op.overlap_with_index}: {other_name}"))
+            else:
+                self.plan_table.setItem(r, 4, QTableWidgetItem("-"))
 
     def on_plan_clear(self):
         self.model.clear_deletion_plan()
