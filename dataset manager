@@ -1,0 +1,1086 @@
+import os
+import sys
+import shutil
+from typing import Dict, List, Optional, Tuple, Set
+
+from PySide6.QtCore import Qt, QPoint
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QFileDialog, QMessageBox, QListWidget, QListWidgetItem,
+    QInputDialog, QTableWidget, QTableWidgetItem, QAbstractItemView,
+    QGroupBox, QCheckBox, QSplitter, QMenu,
+    QDialog, QDialogButtonBox, QComboBox, QSpinBox, QTextEdit,
+    QRadioButton, QButtonGroup, QFormLayout
+)
+
+# PDF (reportlab)
+
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
+
+
+CLASSES_FILENAME = "classes.txt"
+COMMON_IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"]
+
+
+class DatasetError(Exception):
+    pass
+
+
+def is_label_file(path: str) -> bool:
+    base = os.path.basename(path).lower()
+    return base.endswith(".txt") and base != CLASSES_FILENAME
+
+
+def iter_all_files(root: str) -> List[str]:
+    out = []
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            out.append(os.path.join(dirpath, fn))
+    return sorted(out)
+
+
+def iter_label_files(root: str) -> List[str]:
+    return [p for p in iter_all_files(root) if is_label_file(p)]
+
+
+def read_classes_txt(path: str) -> List[str]:
+    if not os.path.exists(path):
+        raise DatasetError(f"Missing {CLASSES_FILENAME} at: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        lines = [ln.rstrip("\n") for ln in f.readlines()]
+    classes = [c.strip() for c in lines if c.strip()]
+    if not classes:
+        raise DatasetError(f"{CLASSES_FILENAME} is empty (no classes).")
+    return classes
+
+
+def write_classes_txt(path: str, classes: List[str]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for c in classes:
+            f.write(c + "\n")
+
+
+def parse_label_line(line: str) -> Optional[Tuple[int, float, float, float, float]]:
+    parts = line.strip().split()
+    if len(parts) < 5:
+        return None
+    try:
+        return int(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+    except ValueError:
+        return None
+
+
+def format_label_line(cid: int, x: float, y: float, w: float, h: float) -> str:
+    return f"{cid} {x:.6f} {y:.6f} {w:.6f} {h:.6f}"
+
+
+def find_matching_image(input_root: str, rel_label_path: str) -> Optional[str]:
+    rel_dir = os.path.dirname(rel_label_path)
+    stem = os.path.splitext(os.path.basename(rel_label_path))[0]
+    for ext in COMMON_IMAGE_EXTS:
+        candidate_rel = os.path.join(rel_dir, stem + ext)
+        candidate_abs = os.path.join(input_root, candidate_rel)
+        if os.path.exists(candidate_abs):
+            return candidate_rel
+    return None
+
+
+class YoloDatasetModel:
+    """
+    - Reads INPUT dataset.
+    - Holds class edits + deletion plan in-memory.
+    - APPLY writes NEW labels/classes into OUTPUT (INPUT not modified).
+    """
+
+    def __init__(self):
+        self.in_root: Optional[str] = None
+        self.out_root: Optional[str] = None
+
+        self.original_classes: List[str] = []
+        self.original_index_to_uid: Dict[int, int] = {}
+        self.uid_to_name: Dict[int, str] = {}
+        self.class_order: List[int] = []
+        self.uid_redirect: Dict[int, int] = {}
+        self.next_uid: int = 1
+        self.loaded: bool = False
+
+        # Index from input
+        self.rel_label_files: List[str] = []
+        self.label_to_classset: Dict[str, Set[int]] = {}
+        self.label_to_box_counts: Dict[str, Dict[int, int]] = {}
+        self.label_to_image_rel: Dict[str, Optional[str]] = {}
+
+        # Deletion plan (affects OUTPUT only)
+        self.delete_rel_labels: Set[str] = set()
+        self.delete_rel_images: Set[str] = set()
+
+    def load_input(self, dataset_root: str) -> None:
+        dataset_root = os.path.abspath(dataset_root)
+        classes = read_classes_txt(os.path.join(dataset_root, CLASSES_FILENAME))
+
+        self.in_root = dataset_root
+        self.original_classes = classes
+
+        self.original_index_to_uid.clear()
+        self.uid_to_name.clear()
+        self.class_order.clear()
+        self.uid_redirect.clear()
+        self.next_uid = 1
+
+        for i, name in enumerate(classes):
+            uid = self.next_uid
+            self.next_uid += 1
+            self.original_index_to_uid[i] = uid
+            self.uid_to_name[uid] = name
+            self.class_order.append(uid)
+
+        self._build_input_index()
+        self.delete_rel_labels.clear()
+        self.delete_rel_images.clear()
+        self.loaded = True
+
+    def _build_input_index(self) -> None:
+        if not self.in_root:
+            return
+        self.rel_label_files = []
+        self.label_to_classset.clear()
+        self.label_to_box_counts.clear()
+        self.label_to_image_rel.clear()
+
+        for abs_lf in iter_label_files(self.in_root):
+            rel = os.path.relpath(abs_lf, self.in_root)
+            self.rel_label_files.append(rel)
+
+            classset: Set[int] = set()
+            box_counts: Dict[int, int] = {}
+
+            try:
+                with open(abs_lf, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+            except Exception:
+                self.label_to_classset[rel] = set()
+                self.label_to_box_counts[rel] = {}
+                self.label_to_image_rel[rel] = find_matching_image(self.in_root, rel)
+                continue
+
+            for ln in lines:
+                parsed = parse_label_line(ln)
+                if not parsed:
+                    continue
+                cid, _, _, _, _ = parsed
+                classset.add(cid)
+                box_counts[cid] = box_counts.get(cid, 0) + 1
+
+            self.label_to_classset[rel] = classset
+            self.label_to_box_counts[rel] = box_counts
+            self.label_to_image_rel[rel] = find_matching_image(self.in_root, rel)
+
+        self.rel_label_files.sort()
+
+    def set_output(self, out_root: str) -> None:
+        if not self.loaded:
+            raise DatasetError("Load input dataset first.")
+        self.out_root = os.path.abspath(out_root)
+
+    def ensure_ready(self) -> None:
+        if not self.loaded or not self.in_root:
+            raise DatasetError("Input dataset not loaded.")
+        if not self.out_root:
+            raise DatasetError("Output folder not set.")
+        if os.path.abspath(self.out_root) == os.path.abspath(self.in_root):
+            raise DatasetError("Output folder must be different from input folder.")
+
+    def _resolve_uid(self, uid: int) -> int:
+        while uid in self.uid_redirect:
+            uid = self.uid_redirect[uid]
+        return uid
+
+    def get_classes(self) -> List[Tuple[int, str]]:
+        return [(i, self.uid_to_name[uid]) for i, uid in enumerate(self.class_order)]
+
+    def rename_class(self, index: int, new_name: str) -> None:
+        if index < 0 or index >= len(self.class_order):
+            raise DatasetError("Invalid class index.")
+        new_name = new_name.strip()
+        if not new_name:
+            raise DatasetError("Class name cannot be empty.")
+        self.uid_to_name[self.class_order[index]] = new_name
+
+    def move_class(self, from_index: int, to_index: int) -> None:
+        n = len(self.class_order)
+        if not (0 <= from_index < n and 0 <= to_index < n):
+            raise DatasetError("Invalid indices.")
+        uid = self.class_order.pop(from_index)
+        self.class_order.insert(to_index, uid)
+
+    def delete_classes_by_indices(self, indices: List[int]) -> None:
+        if not indices:
+            return
+        n = len(self.class_order)
+        idx_set = set(indices)
+        if any(i < 0 or i >= n for i in idx_set):
+            raise DatasetError("Invalid class index in deletion.")
+        if len(idx_set) >= n:
+            raise DatasetError("You cannot delete all classes.")
+        self.class_order = [uid for i, uid in enumerate(self.class_order) if i not in idx_set]
+
+        alive = set(self.class_order)
+        for src, tgt in list(self.uid_redirect.items()):
+            tgt2 = self._resolve_uid(tgt)
+            if tgt2 not in alive:
+                del self.uid_redirect[src]
+
+    def merge_classes(self, source_indices: List[int], target_index: int) -> None:
+        n = len(self.class_order)
+        if target_index < 0 or target_index >= n:
+            raise DatasetError("Invalid target index.")
+
+        src_set = set(source_indices)
+        if target_index in src_set:
+            src_set.remove(target_index)
+        if not src_set:
+            return
+        if any(i < 0 or i >= n for i in src_set):
+            raise DatasetError("Invalid source index in merge.")
+
+        target_uid = self.class_order[target_index]
+        source_uids = [self.class_order[i] for i in sorted(src_set)]
+
+        for suid in source_uids:
+            suid_res = self._resolve_uid(suid)
+            if suid_res != target_uid:
+                self.uid_redirect[suid_res] = target_uid
+
+        remove_set = set(source_uids)
+        self.class_order = [uid for uid in self.class_order if uid not in remove_set]
+
+    # ---------- stats ----------
+    def compute_stats(self) -> Tuple[Dict[int, int], Dict[int, int], Dict[int, int], int, int, List[str]]:
+        if not self.loaded or not self.in_root:
+            raise DatasetError("Input not loaded.")
+
+        warnings: List[str] = []
+        total_label_files = len(self.rel_label_files)
+
+        uid_to_new_index = {uid: i for i, uid in enumerate(self.class_order)}
+        alive_uids = set(self.class_order)
+
+        box_counts_by_uid: Dict[int, int] = {}
+        single_images_by_uid: Dict[int, int] = {}
+        overlap_images_by_uid: Dict[int, int] = {}
+        total_boxes_kept = 0
+
+        for rel in self.rel_label_files:
+            classset = self.label_to_classset.get(rel, set())
+            box_counts = self.label_to_box_counts.get(rel, {})
+
+            alive_uids_in_image: Set[int] = set()
+            for ocid in classset:
+                if ocid not in self.original_index_to_uid:
+                    warnings.append(f"Unknown class id {ocid} in {rel}.")
+                    continue
+                ouid = self._resolve_uid(self.original_index_to_uid[ocid])
+                if ouid in alive_uids:
+                    alive_uids_in_image.add(ouid)
+
+            for ocid, cnt in box_counts.items():
+                if ocid not in self.original_index_to_uid:
+                    continue
+                ouid = self._resolve_uid(self.original_index_to_uid[ocid])
+                if ouid not in alive_uids:
+                    continue
+                box_counts_by_uid[ouid] = box_counts_by_uid.get(ouid, 0) + cnt
+                total_boxes_kept += cnt
+
+            if len(alive_uids_in_image) == 1:
+                only_uid = next(iter(alive_uids_in_image))
+                single_images_by_uid[only_uid] = single_images_by_uid.get(only_uid, 0) + 1
+            elif len(alive_uids_in_image) > 1:
+                for uid in alive_uids_in_image:
+                    overlap_images_by_uid[uid] = overlap_images_by_uid.get(uid, 0) + 1
+
+        box_by_idx: Dict[int, int] = {}
+        single_by_idx: Dict[int, int] = {}
+        overlap_by_idx: Dict[int, int] = {}
+
+        for uid, cnt in box_counts_by_uid.items():
+            idx = uid_to_new_index.get(uid)
+            if idx is not None:
+                box_by_idx[idx] = cnt
+        for uid, cnt in single_images_by_uid.items():
+            idx = uid_to_new_index.get(uid)
+            if idx is not None:
+                single_by_idx[idx] = cnt
+        for uid, cnt in overlap_images_by_uid.items():
+            idx = uid_to_new_index.get(uid)
+            if idx is not None:
+                overlap_by_idx[idx] = cnt
+
+        return box_by_idx, single_by_idx, overlap_by_idx, total_boxes_kept, total_label_files, warnings
+
+    def compute_full_image_stats(self) -> Tuple[Dict[int, int], List[List[int]]]:
+        """
+        Returns:
+          any_images_by_new_index: idx -> count of images containing this class
+          overlap_matrix: NxN, M[i][j] = #images containing both i and j
+        """
+        if not self.loaded or not self.in_root:
+            raise DatasetError("Input not loaded.")
+
+        n = len(self.class_order)
+        uid_to_new_index = {uid: i for i, uid in enumerate(self.class_order)}
+        alive_uids = set(self.class_order)
+
+        any_images_by_idx: Dict[int, int] = {i: 0 for i in range(n)}
+        matrix = [[0 for _ in range(n)] for _ in range(n)]
+
+        for rel in self.rel_label_files:
+            classset = self.label_to_classset.get(rel, set())
+
+            alive_uids_in_image: Set[int] = set()
+            for ocid in classset:
+                if ocid not in self.original_index_to_uid:
+                    continue
+                ouid = self._resolve_uid(self.original_index_to_uid[ocid])
+                if ouid in alive_uids:
+                    alive_uids_in_image.add(ouid)
+
+            if not alive_uids_in_image:
+                continue
+
+            idxs = sorted(uid_to_new_index[uid] for uid in alive_uids_in_image)
+
+            for i in idxs:
+                any_images_by_idx[i] += 1
+
+            for a in range(len(idxs)):
+                for b in range(a + 1, len(idxs)):
+                    i, j = idxs[a], idxs[b]
+                    matrix[i][j] += 1
+                    matrix[j][i] += 1
+
+        return any_images_by_idx, matrix
+
+    # ---------- deletion plan ----------
+    def clear_deletion_plan(self) -> None:
+        self.delete_rel_labels.clear()
+        self.delete_rel_images.clear()
+
+    # ---------- apply ----------
+    def apply_to_output(self, copy_non_label_files: bool) -> Tuple[int, int, int, int, int, List[str]]:
+        self.ensure_ready()
+        assert self.in_root and self.out_root
+
+        warnings: List[str] = []
+        os.makedirs(self.out_root, exist_ok=True)
+
+        uid_to_new_index = {uid: i for i, uid in enumerate(self.class_order)}
+        alive_uids = set(self.class_order)
+
+        write_classes_txt(
+            os.path.join(self.out_root, CLASSES_FILENAME),
+            [self.uid_to_name[uid] for uid in self.class_order]
+        )
+
+        files_copied = 0
+        if copy_non_label_files:
+            for p in iter_all_files(self.in_root):
+                rel = os.path.relpath(p, self.in_root)
+                rel_lower = rel.replace("\\", "/").lower()
+
+                if rel_lower == CLASSES_FILENAME:
+                    continue
+                if rel_lower.endswith(".txt") and rel_lower != CLASSES_FILENAME:
+                    continue
+                if rel in self.delete_rel_images:
+                    continue
+
+                dst = os.path.join(self.out_root, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                try:
+                    shutil.copy2(p, dst)
+                    files_copied += 1
+                except Exception as e:
+                    warnings.append(f"Could not copy {rel} ({e})")
+
+        label_files_written = 0
+        label_lines_removed = 0
+        boxes_written = 0
+        samples_skipped = 0
+
+        for rel in self.rel_label_files:
+            if rel in self.delete_rel_labels:
+                samples_skipped += 1
+                continue
+
+            abs_lf = os.path.join(self.in_root, rel)
+            out_lf = os.path.join(self.out_root, rel)
+            os.makedirs(os.path.dirname(out_lf), exist_ok=True)
+
+            try:
+                with open(abs_lf, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+            except Exception as e:
+                warnings.append(f"Could not read {rel} ({e})")
+                continue
+
+            out_lines: List[str] = []
+            for ln in lines:
+                parsed = parse_label_line(ln)
+                if not parsed:
+                    continue
+
+                cid, x, y, w, h = parsed
+                if cid not in self.original_index_to_uid:
+                    warnings.append(f"Unknown class id {cid} in {rel} -> skipped line.")
+                    continue
+
+                ouid = self._resolve_uid(self.original_index_to_uid[cid])
+                if ouid not in alive_uids:
+                    label_lines_removed += 1
+                    continue
+
+                new_cid = uid_to_new_index[ouid]
+                out_lines.append(format_label_line(new_cid, x, y, w, h))
+                boxes_written += 1
+
+            if not out_lines:
+                continue
+
+            try:
+                with open(out_lf, "w", encoding="utf-8") as f:
+                    for l in out_lines:
+                        f.write(l + "\n")
+                label_files_written += 1
+            except Exception as e:
+                warnings.append(f"Could not write {rel} ({e})")
+
+        return label_files_written, label_lines_removed, boxes_written, files_copied, samples_skipped, warnings
+
+
+
+# --- PDF Export ---
+def export_stats_pdf(model: 'YoloDatasetModel', pdf_path: str) -> None:
+    box_by_idx, single_by_idx, overlap_by_idx, total_boxes, total_files, warnings = model.compute_stats()
+    any_by_idx, overlap_matrix = model.compute_full_image_stats()
+    classes = model.get_classes()
+    n = len(classes)
+
+    styles = getSampleStyleSheet()
+    doc = SimpleDocTemplate(pdf_path, pagesize=A4)
+
+    story = []
+    story.append(Paragraph("YOLO Dataset – Full Statistics Report", styles["Title"]))
+    story.append(Spacer(1, 10))
+
+    story.append(Paragraph(f"<b>Input folder:</b> {model.in_root}", styles["Normal"]))
+    story.append(Paragraph(f"<b>Output folder:</b> {model.out_root}", styles["Normal"]))
+    story.append(Spacer(1, 8))
+
+    story.append(Paragraph(f"<b>Total label files:</b> {total_files}", styles["Normal"]))
+    story.append(Paragraph(f"<b>Total boxes kept:</b> {total_boxes}", styles["Normal"]))
+    story.append(Spacer(1, 12))
+
+    data = [["Index", "Class", "Boxes", "Any images", "Single images", "Overlap images"]]
+    for idx, name in classes:
+        data.append([
+            str(idx),
+            name,
+            str(box_by_idx.get(idx, 0)),
+            str(any_by_idx.get(idx, 0)),
+            str(single_by_idx.get(idx, 0)),
+            str(overlap_by_idx.get(idx, 0)),
+        ])
+
+    table = Table(data)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+    ]))
+
+    story.append(table)
+    doc.build(story)
+
+
+class ManageSamplesDialog(QDialog):
+    """
+    Sub-screen to manage deletion planning for one class:
+    - choose mode (single / overlap-any / overlap-specific / any)
+    - choose N to delete
+    - labels only or labels+images
+    - preview candidates
+    - add to deletion plan
+    """
+    def __init__(self, parent, model: YoloDatasetModel, class_index: int):
+        super().__init__(parent)
+        self.model = model
+        self.class_index = class_index
+
+        self.setWindowTitle("Manage samples for class")
+        self.resize(720, 520)
+
+        main = QVBoxLayout(self)
+
+        self.lbl_title = QLabel("")
+        main.addWidget(self.lbl_title)
+
+        self.stats_box = QLabel("")
+        main.addWidget(self.stats_box)
+
+        modes_group = QGroupBox("Deletion target")
+        modes_layout = QVBoxLayout(modes_group)
+
+        self.rb_single = QRadioButton("Single-class images (only this class)")
+        self.rb_overlap_any = QRadioButton("Overlap images (this class + any other)")
+        self.rb_overlap_specific = QRadioButton("Overlap with specific class (this + selected)")
+        self.rb_any = QRadioButton("Any image containing this class")
+        self.rb_single.setChecked(True)
+
+        self.mode_buttons = QButtonGroup(self)
+        for rb in [self.rb_single, self.rb_overlap_any, self.rb_overlap_specific, self.rb_any]:
+            self.mode_buttons.addButton(rb)
+
+        modes_layout.addWidget(self.rb_single)
+        modes_layout.addWidget(self.rb_overlap_any)
+        modes_layout.addWidget(self.rb_overlap_specific)
+
+        overlap_row = QHBoxLayout()
+        overlap_row.addWidget(QLabel("Overlap-with class:"))
+        self.cmb_overlap = QComboBox()
+        overlap_row.addWidget(self.cmb_overlap, 1)
+        modes_layout.addLayout(overlap_row)
+
+        modes_layout.addWidget(self.rb_any)
+        main.addWidget(modes_group)
+
+        params_group = QGroupBox("Parameters")
+        form = QFormLayout(params_group)
+
+        self.spin_n = QSpinBox()
+        self.spin_n.setRange(1, 1_000_000)
+        self.spin_n.setValue(100)
+        form.addRow("How many images to delete:", self.spin_n)
+
+        self.cmb_delete_kind = QComboBox()
+        self.cmb_delete_kind.addItems([
+            "Delete labels only (keep images)",
+            "Delete labels + images (remove sample completely)"
+        ])
+        form.addRow("Deletion type:", self.cmb_delete_kind)
+
+        self.btn_preview = QPushButton("Preview candidates")
+        self.btn_preview.clicked.connect(self.on_preview)
+        form.addRow(self.btn_preview)
+
+        main.addWidget(params_group)
+
+        self.preview = QTextEdit()
+        self.preview.setReadOnly(True)
+        main.addWidget(self.preview, 1)
+
+        bb = QDialogButtonBox()
+        self.btn_add = bb.addButton("Add to deletion plan", QDialogButtonBox.AcceptRole)
+        self.btn_close = bb.addButton("Close", QDialogButtonBox.RejectRole)
+        self.btn_add.clicked.connect(self.on_add_plan)
+        self.btn_close.clicked.connect(self.reject)
+        main.addWidget(bb)
+
+        self._populate_overlap_classes()
+        self._refresh_header()
+        self.on_preview()
+
+        self.rb_overlap_specific.toggled.connect(self._update_overlap_enabled)
+        self._update_overlap_enabled()
+
+    def _update_overlap_enabled(self):
+        self.cmb_overlap.setEnabled(self.rb_overlap_specific.isChecked())
+
+    def _populate_overlap_classes(self):
+        self.cmb_overlap.clear()
+        for idx, name in self.model.get_classes():
+            if idx == self.class_index:
+                continue
+            self.cmb_overlap.addItem(f"{idx}: {name}", idx)
+
+    def _refresh_header(self):
+        name = self.model.get_classes()[self.class_index][1]
+        self.lbl_title.setText(f"Class {self.class_index}: {name}")
+
+        box_by_idx, single_by_idx, overlap_by_idx, _, _, _ = self.model.compute_stats()
+        boxes = box_by_idx.get(self.class_index, 0)
+        singles = single_by_idx.get(self.class_index, 0)
+        overlaps = overlap_by_idx.get(self.class_index, 0)
+        self.stats_box.setText(f"Stats: Boxes={boxes} | Single-images={singles} | Overlap-images={overlaps}")
+
+    def _compute_candidates(self) -> List[str]:
+        target_uid = self.model.class_order[self.class_index]
+        alive_uids = set(self.model.class_order)
+
+        require_uid = None
+        if self.rb_overlap_specific.isChecked() and self.cmb_overlap.currentIndex() >= 0:
+            require_idx = int(self.cmb_overlap.currentData())
+            require_uid = self.model.class_order[require_idx]
+
+        candidates: List[str] = []
+        for rel in self.model.rel_label_files:
+            classset = self.model.label_to_classset.get(rel, set())
+
+            alive_uids_in_image: Set[int] = set()
+            for ocid in classset:
+                if ocid not in self.model.original_index_to_uid:
+                    continue
+                ouid = self.model._resolve_uid(self.model.original_index_to_uid[ocid])
+                if ouid in alive_uids:
+                    alive_uids_in_image.add(ouid)
+
+            if target_uid not in alive_uids_in_image:
+                continue
+
+            if self.rb_single.isChecked():
+                if len(alive_uids_in_image) == 1:
+                    candidates.append(rel)
+            elif self.rb_overlap_any.isChecked():
+                if len(alive_uids_in_image) > 1:
+                    candidates.append(rel)
+            elif self.rb_overlap_specific.isChecked():
+                if require_uid is None:
+                    continue
+                if len(alive_uids_in_image) > 1 and require_uid in alive_uids_in_image:
+                    candidates.append(rel)
+            elif self.rb_any.isChecked():
+                candidates.append(rel)
+
+        candidates.sort()
+        candidates = [c for c in candidates if c not in self.model.delete_rel_labels]
+        return candidates
+
+    def on_preview(self):
+        candidates = self._compute_candidates()
+        n = self.spin_n.value()
+        take = candidates[:n]
+
+        mode_txt = "single" if self.rb_single.isChecked() else \
+                   "overlap-any" if self.rb_overlap_any.isChecked() else \
+                   "overlap-specific" if self.rb_overlap_specific.isChecked() else "any"
+
+        self.preview.setPlainText(
+            f"Mode: {mode_txt}\n"
+            f"Available candidates: {len(candidates)}\n"
+            f"Will add to plan: {min(n, len(candidates))}\n\n"
+            f"First {min(30, len(take))} files:\n" +
+            "\n".join(take[:30])
+        )
+
+    def on_add_plan(self):
+        candidates = self._compute_candidates()
+        n = self.spin_n.value()
+        take = candidates[:n]
+        if not take:
+            QMessageBox.information(self, "Nothing to add", "No candidates match the selected filter.")
+            return
+
+        delete_images_too = (self.cmb_delete_kind.currentIndex() == 1)
+
+        labels_added = 0
+        images_added = 0
+        for rel_label in take:
+            if rel_label in self.model.delete_rel_labels:
+                continue
+            self.model.delete_rel_labels.add(rel_label)
+            labels_added += 1
+            if delete_images_too:
+                rel_img = self.model.label_to_image_rel.get(rel_label)
+                if rel_img:
+                    self.model.delete_rel_images.add(rel_img)
+                    images_added += 1
+
+        QMessageBox.information(self, "Added", f"Added: {labels_added} labels, {images_added} images")
+        self.on_preview()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("YOLO Dataset Manager")
+        self.resize(1250, 720)
+
+        self.model = YoloDatasetModel()
+
+        root = QWidget()
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
+
+        # Top row
+        top = QHBoxLayout()
+        layout.addLayout(top)
+
+        self.lbl_in = QLabel("Input: (not loaded)")
+        self.lbl_in.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        top.addWidget(self.lbl_in, 2)
+
+        self.btn_in = QPushButton("Select INPUT dataset folder")
+        self.btn_in.clicked.connect(self.on_select_input)
+        top.addWidget(self.btn_in)
+
+        self.lbl_out = QLabel("Output: (not set)")
+        self.lbl_out.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        top.addWidget(self.lbl_out, 2)
+
+        self.btn_out = QPushButton("Select OUTPUT folder")
+        self.btn_out.clicked.connect(self.on_select_output)
+        top.addWidget(self.btn_out)
+
+        self.chk_copy = QCheckBox("Copy non-label files (images etc.) to output")
+        self.chk_copy.setChecked(True)
+        top.addWidget(self.chk_copy)
+
+        self.btn_apply = QPushButton("APPLY -> Write to OUTPUT")
+        self.btn_apply.clicked.connect(self.on_apply)
+        top.addWidget(self.btn_apply)
+
+        splitter = QSplitter(Qt.Horizontal)
+        layout.addWidget(splitter, 1)
+
+        # Left (classes)
+        left = QWidget()
+        left_lay = QVBoxLayout(left)
+        splitter.addWidget(left)
+
+        gb_classes = QGroupBox("Classes (right-click a class for actions)")
+        gb_lay = QVBoxLayout(gb_classes)
+        left_lay.addWidget(gb_classes, 1)
+
+        self.class_list = QListWidget()
+        self.class_list.setSelectionMode(QAbstractItemView.MultiSelection)
+        self.class_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.class_list.customContextMenuRequested.connect(self.on_class_context_menu)
+        gb_lay.addWidget(self.class_list, 1)
+
+        btn_row = QHBoxLayout()
+        gb_lay.addLayout(btn_row)
+
+        self.btn_rename = QPushButton("Rename")
+        self.btn_rename.clicked.connect(self.on_rename)
+        btn_row.addWidget(self.btn_rename)
+
+        self.btn_up = QPushButton("Move Up")
+        self.btn_up.clicked.connect(self.on_up)
+        btn_row.addWidget(self.btn_up)
+
+        self.btn_down = QPushButton("Move Down")
+        self.btn_down.clicked.connect(self.on_down)
+        btn_row.addWidget(self.btn_down)
+
+        self.btn_merge = QPushButton("Merge -> Lowest Selected")
+        self.btn_merge.clicked.connect(self.on_merge)
+        btn_row.addWidget(self.btn_merge)
+
+        self.btn_delete = QPushButton("Delete Selected Classes")
+        self.btn_delete.clicked.connect(self.on_delete_classes)
+        btn_row.addWidget(self.btn_delete)
+
+        # Right (stats)
+        right = QWidget()
+        right_lay = QVBoxLayout(right)
+        splitter.addWidget(right)
+
+        gb_stats = QGroupBox("Statistics (computed from INPUT labels, after edits)")
+        gb_stats_lay = QVBoxLayout(gb_stats)
+        right_lay.addWidget(gb_stats, 1)
+
+        info = QHBoxLayout()
+        gb_stats_lay.addLayout(info)
+        self.lbl_files = QLabel("Label files: -")
+        self.lbl_boxes = QLabel("Total boxes kept: -")
+        self.lbl_delplan = QLabel("Deletion plan: 0 labels, 0 images")
+        info.addWidget(self.lbl_files)
+        info.addWidget(self.lbl_boxes)
+        info.addWidget(self.lbl_delplan)
+        info.addStretch(1)
+
+        # Buttons next to each other (as requested)
+        self.btn_refresh = QPushButton("Refresh Stats")
+        self.btn_refresh.clicked.connect(self.refresh_stats)
+        info.addWidget(self.btn_refresh)
+
+        self.btn_pdf = QPushButton("Export Stats PDF")
+        self.btn_pdf.clicked.connect(self.on_export_pdf)
+        info.addWidget(self.btn_pdf)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Index", "Class Name", "Boxes", "Single-class Images", "Overlap Images"])
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        gb_stats_lay.addWidget(self.table, 1)
+
+        gb_warn = QGroupBox("Warnings")
+        gb_warn_lay = QVBoxLayout(gb_warn)
+        right_lay.addWidget(gb_warn, 0)
+
+        self.lbl_warn = QLabel("")
+        self.lbl_warn.setWordWrap(True)
+        self.lbl_warn.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        gb_warn_lay.addWidget(self.lbl_warn)
+
+        self.set_enabled(False)
+
+    def set_enabled(self, on: bool):
+        for w in [
+            self.class_list, self.btn_rename, self.btn_up, self.btn_down,
+            self.btn_merge, self.btn_delete, self.btn_refresh, self.btn_pdf,
+            self.btn_apply, self.btn_out, self.chk_copy
+        ]:
+            w.setEnabled(on)
+
+    def selected_indices(self) -> List[int]:
+        return sorted({self.class_list.row(it) for it in self.class_list.selectedItems()})
+
+    def refresh_class_list(self):
+        self.class_list.clear()
+        for i, name in self.model.get_classes():
+            self.class_list.addItem(QListWidgetItem(f"{i}: {name}"))
+
+    def refresh_stats(self):
+        try:
+            box_by_idx, single_by_idx, overlap_by_idx, total_boxes, total_files, warnings = self.model.compute_stats()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+            return
+
+        self.lbl_files.setText(f"Label files: {total_files}")
+        self.lbl_boxes.setText(f"Total boxes kept: {total_boxes}")
+        self.lbl_delplan.setText(
+            f"Deletion plan: {len(self.model.delete_rel_labels)} labels, {len(self.model.delete_rel_images)} images"
+        )
+
+        classes = self.model.get_classes()
+        self.table.setRowCount(len(classes))
+        for r, (idx, name) in enumerate(classes):
+            self.table.setItem(r, 0, QTableWidgetItem(str(idx)))
+            self.table.setItem(r, 1, QTableWidgetItem(name))
+            self.table.setItem(r, 2, QTableWidgetItem(str(box_by_idx.get(idx, 0))))
+            self.table.setItem(r, 3, QTableWidgetItem(str(single_by_idx.get(idx, 0))))
+            self.table.setItem(r, 4, QTableWidgetItem(str(overlap_by_idx.get(idx, 0))))
+
+        if warnings:
+            show = warnings[:12]
+            extra = len(warnings) - len(show)
+            txt = "Warnings:\n" + "\n".join(f"- {w}" for w in show)
+            if extra > 0:
+                txt += f"\n... (+{extra} more)"
+            self.lbl_warn.setText(txt)
+        else:
+            self.lbl_warn.setText("")
+
+    def on_select_input(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select INPUT YOLO dataset folder")
+        if not folder:
+            return
+        try:
+            self.model.load_input(folder)
+            self.lbl_in.setText(f"Input: {os.path.abspath(folder)}")
+            self.refresh_class_list()
+            self.refresh_stats()
+            self.set_enabled(True)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+            self.set_enabled(False)
+
+    def on_select_output(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select OUTPUT folder (can be empty)")
+        if not folder:
+            return
+        try:
+            self.model.set_output(folder)
+            self.lbl_out.setText(f"Output: {os.path.abspath(folder)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def on_export_pdf(self):
+        if not self.model.loaded:
+            QMessageBox.warning(self, "PDF", "Load an input dataset first.")
+            return
+
+        default_name = "yolo_full_stats_report.pdf"
+        start_dir = self.model.out_root if self.model.out_root else self.model.in_root
+
+        pdf_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Statistics PDF",
+            os.path.join(start_dir, default_name) if start_dir else default_name,
+            "PDF Files (*.pdf)"
+        )
+        if not pdf_path:
+            return
+
+        try:
+            export_stats_pdf(self.model, pdf_path)
+            QMessageBox.information(self, "PDF", f"PDF saved:\n{pdf_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "PDF Error", str(e))
+
+    # ----- class actions -----
+    def on_rename(self):
+        idxs = self.selected_indices()
+        if len(idxs) != 1:
+            QMessageBox.warning(self, "Rename", "Select exactly ONE class to rename.")
+            return
+        i = idxs[0]
+        old = self.model.get_classes()[i][1]
+        new, ok = QInputDialog.getText(self, "Rename Class", f"New name for index {i}:", text=old)
+        if not ok:
+            return
+        try:
+            self.model.rename_class(i, new)
+            self.refresh_class_list()
+            self.refresh_stats()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def on_up(self):
+        idxs = self.selected_indices()
+        if len(idxs) != 1:
+            QMessageBox.warning(self, "Move", "Select exactly ONE class to move.")
+            return
+        i = idxs[0]
+        if i == 0:
+            return
+        try:
+            self.model.move_class(i, i - 1)
+            self.refresh_class_list()
+            self.class_list.setCurrentRow(i - 1)
+            self.refresh_stats()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def on_down(self):
+        idxs = self.selected_indices()
+        if len(idxs) != 1:
+            QMessageBox.warning(self, "Move", "Select exactly ONE class to move.")
+            return
+        i = idxs[0]
+        if i >= self.class_list.count() - 1:
+            return
+        try:
+            self.model.move_class(i, i + 1)
+            self.refresh_class_list()
+            self.class_list.setCurrentRow(i + 1)
+            self.refresh_stats()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def on_merge(self):
+        idxs = self.selected_indices()
+        if len(idxs) < 2:
+            QMessageBox.warning(self, "Merge", "Select TWO OR MORE classes to merge.")
+            return
+        target = idxs[0]
+        sources = idxs[1:]
+        try:
+            self.model.merge_classes(sources, target)
+            self.refresh_class_list()
+            self.refresh_stats()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def on_delete_classes(self):
+        idxs = self.selected_indices()
+        if not idxs:
+            return
+        reply = QMessageBox.question(
+            self, "Delete Classes",
+            f"Delete {len(idxs)} class(es)?\n\n"
+            "They will be removed from OUTPUT/classes.txt and their annotations will be removed from OUTPUT labels."
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            self.model.delete_classes_by_indices(idxs)
+            self.refresh_class_list()
+            self.refresh_stats()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def on_class_context_menu(self, pos: QPoint):
+        item = self.class_list.itemAt(pos)
+        if item is None:
+            menu = QMenu(self)
+            act_clear = menu.addAction("Clear deletion plan")
+            chosen = menu.exec(self.class_list.mapToGlobal(pos))
+            if chosen == act_clear:
+                self.model.clear_deletion_plan()
+                self.refresh_stats()
+            return
+
+        row = self.class_list.row(item)
+        class_name = self.model.get_classes()[row][1]
+
+        menu = QMenu(self)
+        menu.addSection(f"Class {row}: {class_name}")
+
+        act_manage = menu.addAction("Manage samples... (sub-screen)")
+        menu.addSeparator()
+        act_clear = menu.addAction("Clear deletion plan")
+
+        chosen = menu.exec(self.class_list.mapToGlobal(pos))
+        if chosen is None:
+            return
+
+        if chosen == act_clear:
+            self.model.clear_deletion_plan()
+            self.refresh_stats()
+            return
+
+        if chosen == act_manage:
+            dlg = ManageSamplesDialog(self, self.model, row)
+            dlg.exec()
+            self.refresh_stats()
+            return
+
+    def on_apply(self):
+        try:
+            self.model.ensure_ready()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+            return
+
+        reply = QMessageBox.question(
+            self, "Apply",
+            "This will WRITE a new dataset into OUTPUT folder.\n\n"
+            "INPUT will NOT be changed.\n\nContinue?"
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            lf_written, removed, boxes_written, files_copied, samples_skipped, warnings = self.model.apply_to_output(
+                copy_non_label_files=self.chk_copy.isChecked()
+            )
+            msg = (
+                "Output dataset created.\n\n"
+                f"Label files written: {lf_written}\n"
+                f"Label files skipped (deletion plan): {samples_skipped}\n"
+                f"Annotation lines removed (deleted classes): {removed}\n"
+                f"Boxes written: {boxes_written}\n"
+                f"Non-label files copied: {files_copied}\n"
+            )
+            if warnings:
+                msg += f"\nWarnings: {len(warnings)}\n"
+            QMessageBox.information(self, "Done", msg)
+            self.refresh_stats()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+
+def main():
+    app = QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
