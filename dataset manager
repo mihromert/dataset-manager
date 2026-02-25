@@ -99,6 +99,61 @@ def find_matching_image(input_root: str, rel_label_path: str) -> Optional[str]:
 
 
 class YoloDatasetModel:
+    def candidates_for_op(self, op: 'DeletionOp') -> List[str]:
+        target_uid = self.class_order[op.class_index]
+        alive_uids = set(self.class_order)
+
+        require_uid = None
+        if op.mode == "overlap-specific" and op.overlap_with_index is not None:
+            require_uid = self.class_order[op.overlap_with_index]
+
+        candidates: List[str] = []
+        for rel in self.rel_label_files:
+            classset = self.label_to_classset.get(rel, set())
+
+            alive_uids_in_image: Set[int] = set()
+            for ocid in classset:
+                if ocid not in self.original_index_to_uid:
+                    continue
+                ouid = self._resolve_uid(self.original_index_to_uid[ocid])
+                if ouid in alive_uids:
+                    alive_uids_in_image.add(ouid)
+
+            if target_uid not in alive_uids_in_image:
+                continue
+
+            if op.mode == "single":
+                if len(alive_uids_in_image) == 1:
+                    candidates.append(rel)
+            elif op.mode == "overlap-any":
+                if len(alive_uids_in_image) > 1:
+                    candidates.append(rel)
+            elif op.mode == "overlap-specific":
+                if require_uid is None:
+                    continue
+                if len(alive_uids_in_image) > 1 and require_uid in alive_uids_in_image:
+                    candidates.append(rel)
+            elif op.mode == "any":
+                candidates.append(rel)
+
+        candidates.sort()
+        return candidates
+
+    def rebuild_deletion_sets_from_ops(self) -> None:
+        self.delete_rel_labels.clear()
+        self.delete_rel_images.clear()
+
+        for op in self.deletion_ops:
+            candidates = self.candidates_for_op(op)
+            candidates = [c for c in candidates if c not in self.delete_rel_labels]
+            take = candidates[:op.n]
+
+            for rel_label in take:
+                self.delete_rel_labels.add(rel_label)
+                if op.delete_images_too:
+                    rel_img = self.label_to_image_rel.get(rel_label)
+                    if rel_img:
+                        self.delete_rel_images.add(rel_img)
     """
     - Reads INPUT dataset.
     - Holds class edits + deletion plan in-memory.
@@ -542,6 +597,12 @@ class ManageSamplesDialog(QDialog):
         self.stats_box = QLabel("")
         main.addWidget(self.stats_box)
 
+        self.lbl_overlap_info = QLabel("")
+        main.addWidget(self.lbl_overlap_info)
+
+        self.lbl_candidates = QLabel("")
+        main.addWidget(self.lbl_candidates)
+
         modes_group = QGroupBox("Deletion target")
         modes_layout = QVBoxLayout(modes_group)
 
@@ -603,9 +664,34 @@ class ManageSamplesDialog(QDialog):
         self._populate_overlap_classes()
         self._refresh_header()
         self.on_preview()
+        self._refresh_overlap_info()
+
+        self.rb_single.toggled.connect(self._refresh_overlap_info)
+        self.rb_overlap_any.toggled.connect(self._refresh_overlap_info)
+        self.rb_overlap_specific.toggled.connect(self._refresh_overlap_info)
+        self.rb_any.toggled.connect(self._refresh_overlap_info)
+        self.cmb_overlap.currentIndexChanged.connect(self._refresh_overlap_info)
 
         self.rb_overlap_specific.toggled.connect(self._update_overlap_enabled)
         self._update_overlap_enabled()
+    def _refresh_overlap_info(self):
+        # Always show "how many images contain this class"
+        any_by_idx, overlap_matrix = self.model.compute_full_image_stats()
+        base_any = any_by_idx.get(self.class_index, 0)
+
+        # If overlap-specific is selected, show pairwise overlap too
+        if self.rb_overlap_specific.isChecked() and self.cmb_overlap.currentIndex() >= 0:
+            other_idx = int(self.cmb_overlap.currentData())
+            pair = overlap_matrix[self.class_index][other_idx]
+            self.lbl_overlap_info.setText(
+                f"Any images with this class: {base_any} | "
+                f"Overlap with selected class: {pair}"
+            )
+        else:
+            self.lbl_overlap_info.setText(f"Any images with this class: {base_any}")
+
+        # Also show how many candidates match the CURRENT mode
+        self.lbl_candidates.setText(f"Candidates for current filter: {len(self._compute_candidates())}")
 
     def _update_overlap_enabled(self):
         self.cmb_overlap.setEnabled(self.rb_overlap_specific.isChecked())
@@ -685,6 +771,7 @@ class ManageSamplesDialog(QDialog):
             f"First {min(30, len(take))} files:\n" +
             "\n".join(take[:30])
         )
+        self._refresh_overlap_info()
 
     def on_add_plan(self):
         candidates = self._compute_candidates()
@@ -710,23 +797,12 @@ class ManageSamplesDialog(QDialog):
             overlap_with_index=overlap_idx
         )
         self.model.deletion_ops.append(op)
+        self.model.rebuild_deletion_sets_from_ops()
 
-        delete_images_too = (self.cmb_delete_kind.currentIndex() == 1)
-
-        labels_added = 0
-        images_added = 0
-        for rel_label in take:
-            if rel_label in self.model.delete_rel_labels:
-                continue
-            self.model.delete_rel_labels.add(rel_label)
-            labels_added += 1
-            if delete_images_too:
-                rel_img = self.model.label_to_image_rel.get(rel_label)
-                if rel_img:
-                    self.model.delete_rel_images.add(rel_img)
-                    images_added += 1
-
-        QMessageBox.information(self, "Added", f"Added: {labels_added} labels, {images_added} images")
+        QMessageBox.information(
+            self, "Added",
+            f"Plan now contains: {len(self.model.delete_rel_labels)} labels, {len(self.model.delete_rel_images)} images"
+        )
         self.on_preview()
 
 
@@ -865,11 +941,17 @@ class MainWindow(QMainWindow):
         self.btn_plan_clear.clicked.connect(self.on_plan_clear)
         plan_top.addWidget(self.btn_plan_clear)
 
+        self.btn_plan_cancel = QPushButton("Cancel selected order")
+        self.btn_plan_cancel.clicked.connect(self.on_plan_cancel_selected)
+        plan_top.addWidget(self.btn_plan_cancel)
+
         plan_top.addStretch(1)
 
         self.plan_table = QTableWidget(0, 5)
         self.plan_table.setHorizontalHeaderLabels(["Class", "Mode", "N", "Type", "Overlap-with"])
         self.plan_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.plan_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.plan_table.setSelectionMode(QAbstractItemView.SingleSelection)
         gb_plan_lay.addWidget(self.plan_table)
 
         self.set_enabled(False)
@@ -879,9 +961,27 @@ class MainWindow(QMainWindow):
             self.class_list, self.btn_rename, self.btn_up, self.btn_down,
             self.btn_merge, self.btn_delete, self.btn_refresh, self.btn_pdf,
             self.btn_apply, self.btn_out, self.chk_copy,
-            self.btn_plan_clear, self.plan_table
+            self.btn_plan_clear, self.btn_plan_cancel, self.plan_table
         ]:
             w.setEnabled(on)
+    def on_plan_cancel_selected(self):
+        row = self.plan_table.currentRow()
+        if row < 0 or row >= len(self.model.deletion_ops):
+            QMessageBox.information(self, "Plan", "Select one order to cancel.")
+            return
+
+        op = self.model.deletion_ops[row]
+        reply = QMessageBox.question(
+            self, "Cancel order",
+            "Cancel the selected order?\n\n"
+            "The deletion plan will be recomputed."
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        del self.model.deletion_ops[row]
+        self.model.rebuild_deletion_sets_from_ops()
+        self.refresh_stats()
 
     def selected_indices(self) -> List[int]:
         return sorted({self.class_list.row(it) for it in self.class_list.selectedItems()})
