@@ -825,13 +825,60 @@ class MainWindow(QMainWindow):
         self.lbl_warn.setTextInteractionFlags(Qt.TextSelectableByMouse)
         gb_warn_lay.addWidget(self.lbl_warn)
 
+        # --- Deletion plan panel ---
+        gb_plan = QGroupBox("Deletion plan (OUTPUT changes)")
+        gb_plan_lay = QVBoxLayout(gb_plan)
+        right_lay.addWidget(gb_plan, 1)
+
+        plan_top = QHBoxLayout()
+        gb_plan_lay.addLayout(plan_top)
+
+        self.btn_plan_remove_selected = QPushButton("Remove selected from plan")
+        self.btn_plan_remove_selected.clicked.connect(self.on_plan_remove_selected)
+        plan_top.addWidget(self.btn_plan_remove_selected)
+
+        self.btn_plan_clear = QPushButton("Clear plan")
+        self.btn_plan_clear.clicked.connect(self.on_plan_clear)
+        plan_top.addWidget(self.btn_plan_clear)
+
+        plan_top.addStretch(1)
+
+        # Two lists side by side: labels + images
+        plan_split = QSplitter(Qt.Horizontal)
+        gb_plan_lay.addWidget(plan_split, 1)
+
+        plan_left = QWidget()
+        plan_left_lay = QVBoxLayout(plan_left)
+        plan_left_lay.setContentsMargins(0, 0, 0, 0)
+        plan_split.addWidget(plan_left)
+
+        plan_right = QWidget()
+        plan_right_lay = QVBoxLayout(plan_right)
+        plan_right_lay.setContentsMargins(0, 0, 0, 0)
+        plan_split.addWidget(plan_right)
+
+        plan_left_lay.addWidget(QLabel("Labels to delete/skip:"))
+        self.list_plan_labels = QListWidget()
+        self.list_plan_labels.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        plan_left_lay.addWidget(self.list_plan_labels, 1)
+
+        plan_right_lay.addWidget(QLabel("Images to delete (if selected):"))
+        self.list_plan_images = QListWidget()
+        self.list_plan_images.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        plan_right_lay.addWidget(self.list_plan_images, 1)
+
+        plan_split.setStretchFactor(0, 1)
+        plan_split.setStretchFactor(1, 1)
+
         self.set_enabled(False)
 
     def set_enabled(self, on: bool):
         for w in [
             self.class_list, self.btn_rename, self.btn_up, self.btn_down,
             self.btn_merge, self.btn_delete, self.btn_refresh, self.btn_pdf,
-            self.btn_apply, self.btn_out, self.chk_copy
+            self.btn_apply, self.btn_out, self.chk_copy,
+            self.btn_plan_remove_selected, self.btn_plan_clear,
+            self.list_plan_labels, self.list_plan_images
         ]:
             w.setEnabled(on)
 
@@ -874,6 +921,48 @@ class MainWindow(QMainWindow):
             self.lbl_warn.setText(txt)
         else:
             self.lbl_warn.setText("")
+
+        self.refresh_deletion_plan_view()
+
+    def refresh_deletion_plan_view(self):
+        # Labels
+        self.list_plan_labels.clear()
+        for rel in sorted(self.model.delete_rel_labels):
+            self.list_plan_labels.addItem(QListWidgetItem(rel))
+
+        # Images
+        self.list_plan_images.clear()
+        for rel in sorted(self.model.delete_rel_images):
+            self.list_plan_images.addItem(QListWidgetItem(rel))
+
+    def on_plan_clear(self):
+        self.model.clear_deletion_plan()
+        self.refresh_stats()
+
+    def on_plan_remove_selected(self):
+        removed_labels = 0
+        removed_images = 0
+
+        # Remove selected labels
+        for it in self.list_plan_labels.selectedItems():
+            rel = it.text()
+            if rel in self.model.delete_rel_labels:
+                self.model.delete_rel_labels.remove(rel)
+                removed_labels += 1
+
+        # Remove selected images
+        for it in self.list_plan_images.selectedItems():
+            rel = it.text()
+            if rel in self.model.delete_rel_images:
+                self.model.delete_rel_images.remove(rel)
+                removed_images += 1
+
+        if removed_labels == 0 and removed_images == 0:
+            QMessageBox.information(self, "Plan", "Nothing selected.")
+            return
+
+        self.refresh_stats()
+        QMessageBox.information(self, "Plan", f"Removed: {removed_labels} labels, {removed_images} images")
 
     def on_select_input(self):
         folder = QFileDialog.getExistingDirectory(self, "Select INPUT YOLO dataset folder")
