@@ -89,12 +89,21 @@ def format_label_line(cid: int, x: float, y: float, w: float, h: float) -> str:
 
 def find_matching_image(input_root: str, rel_label_path: str) -> Optional[str]:
     rel_dir = os.path.dirname(rel_label_path)
-    stem = os.path.splitext(os.path.basename(rel_label_path))[0]
-    for ext in COMMON_IMAGE_EXTS:
-        candidate_rel = os.path.join(rel_dir, stem + ext)
-        candidate_abs = os.path.join(input_root, candidate_rel)
-        if os.path.exists(candidate_abs):
-            return candidate_rel
+    stem = os.path.splitext(os.path.basename(rel_label_path))[0].lower()
+
+    abs_dir = os.path.join(input_root, rel_dir) if rel_dir else input_root
+    if not os.path.isdir(abs_dir):
+        return None
+
+    try:
+        for fn in os.listdir(abs_dir):
+            base, ext = os.path.splitext(fn)
+            if base.lower() == stem and ext.lower() in COMMON_IMAGE_EXTS:
+                rel = os.path.join(rel_dir, fn) if rel_dir else fn
+                return os.path.normpath(rel)
+    except OSError:
+        return None
+
     return None
 
 
@@ -153,7 +162,7 @@ class YoloDatasetModel:
                 if op.delete_images_too:
                     rel_img = self.label_to_image_rel.get(rel_label)
                     if rel_img:
-                        self.delete_rel_images.add(rel_img)
+                        self.delete_rel_images.add(os.path.normpath(rel_img))
     """
     - Reads INPUT dataset.
     - Holds class edits + deletion plan in-memory.
@@ -217,7 +226,7 @@ class YoloDatasetModel:
         self.label_to_image_rel.clear()
 
         for abs_lf in iter_label_files(self.in_root):
-            rel = os.path.relpath(abs_lf, self.in_root)
+            rel = os.path.normpath(os.path.relpath(abs_lf, self.in_root))
             self.rel_label_files.append(rel)
 
             classset: Set[int] = set()
@@ -455,7 +464,7 @@ class YoloDatasetModel:
         files_copied = 0
         if copy_non_label_files:
             for p in iter_all_files(self.in_root):
-                rel = os.path.relpath(p, self.in_root)
+                rel = os.path.normpath(os.path.relpath(p, self.in_root))
                 rel_lower = rel.replace("\\", "/").lower()
 
                 if rel_lower == CLASSES_FILENAME:
