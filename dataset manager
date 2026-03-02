@@ -4,14 +4,6 @@ import shutil
 from typing import Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass
 
-@dataclass(frozen=True)
-class DeletionOp:
-    class_index: int
-    mode: str  # "single" | "overlap-any" | "overlap-specific" | "any"
-    n: int
-    delete_images_too: bool
-    overlap_with_index: Optional[int] = None
-
 from PySide6.QtCore import Qt, QPoint
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -23,9 +15,8 @@ from PySide6.QtWidgets import (
 )
 
 # PDF (reportlab)
-
 from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
 
@@ -36,6 +27,15 @@ COMMON_IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"]
 
 class DatasetError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class DeletionOp:
+    class_index: int
+    mode: str  # "single" | "overlap-any" | "overlap-specific" | "any"
+    n: int
+    delete_images_too: bool
+    overlap_with_index: Optional[int] = None
 
 
 def is_label_file(path: str) -> bool:
@@ -53,6 +53,15 @@ def iter_all_files(root: str) -> List[str]:
 
 def iter_label_files(root: str) -> List[str]:
     return [p for p in iter_all_files(root) if is_label_file(p)]
+
+
+def iter_image_files(root: str) -> List[str]:
+    out: List[str] = []
+    for p in iter_all_files(root):
+        _, ext = os.path.splitext(p)
+        if ext.lower() in COMMON_IMAGE_EXTS:
+            out.append(p)
+    return sorted(out)
 
 
 def read_classes_txt(path: str) -> List[str]:
@@ -87,27 +96,121 @@ def format_label_line(cid: int, x: float, y: float, w: float, h: float) -> str:
     return f"{cid} {x:.6f} {y:.6f} {w:.6f} {h:.6f}"
 
 
-def find_matching_image(input_root: str, rel_label_path: str) -> Optional[str]:
-    rel_dir = os.path.dirname(rel_label_path)
-    stem = os.path.splitext(os.path.basename(rel_label_path))[0].lower()
-
-    abs_dir = os.path.join(input_root, rel_dir) if rel_dir else input_root
-    if not os.path.isdir(abs_dir):
-        return None
-
-    try:
-        for fn in os.listdir(abs_dir):
-            base, ext = os.path.splitext(fn)
-            if base.lower() == stem and ext.lower() in COMMON_IMAGE_EXTS:
-                rel = os.path.join(rel_dir, fn) if rel_dir else fn
-                return os.path.normpath(rel)
-    except OSError:
-        return None
-
-    return None
-
-
 class YoloDatasetModel:
+    """
+    - Reads INPUT dataset.
+    - Holds class edits + deletion plan in-memory.
+    - APPLY writes NEW labels/classes into OUTPUT (INPUT not modified).
+    """
+
+    def __init__(self):
+        self.in_root: Optional[str] = None
+        self.out_root: Optional[str] = None
+
+        self.original_classes: List[str] = []
+        self.original_index_to_uid: Dict[int, int] = {}
+        self.uid_to_name: Dict[int, str] = {}
+        self.class_order: List[int] = []
+        self.uid_redirect: Dict[int, int] = {}
+        self.next_uid: int = 1
+        self.loaded: bool = False
+
+        # Index from input
+        self.rel_label_files: List[str] = []
+        self.label_to_classset: Dict[str, Set[int]] = {}
+        self.label_to_box_counts: Dict[str, Dict[int, int]] = {}
+
+        # Image matching/index
+        self.image_index_by_stem: Dict[str, List[str]] = {}
+        self.label_to_image_rel: Dict[str, Optional[str]] = {}
+
+        # Deletion plan (affects OUTPUT only)
+        self.delete_rel_labels: Set[str] = set()
+        self.delete_rel_images: Set[str] = set()
+        self.deletion_ops: List[DeletionOp] = []
+
+    # ---------- image matching ----------
+    @staticmethod
+    def _norm_rel(p: str) -> str:
+        return os.path.normpath(p).replace("\\", "/")
+
+    @staticmethod
+    def _path_parts(rel: str) -> List[str]:
+        return [x for x in YoloDatasetModel._norm_rel(rel).split("/") if x]
+
+    def _score_image_candidate(self, rel_label: str, rel_img: str) -> int:
+        """
+        Higher score = better match.
+        Heuristics:
+          - prefer same relative directory
+          - prefer swapping 'labels' <-> 'images'
+          - prefer more shared suffix path components (train/val/test etc.)
+        """
+        l_parts = self._path_parts(rel_label)
+        i_parts = self._path_parts(rel_img)
+        l_dir = "/".join(l_parts[:-1])
+        i_dir = "/".join(i_parts[:-1])
+
+        score = 0
+
+        if l_dir == i_dir:
+            score += 100
+
+        # labels/... -> images/... heuristic
+        if "labels" in l_parts:
+            l_swapped = l_parts[:]
+            l_swapped = ["images" if p == "labels" else p for p in l_swapped]
+            if "/".join(l_swapped[:-1]) == i_dir:
+                score += 80
+
+        # images/... -> labels/... heuristic (rare but safe)
+        if "images" in l_parts:
+            l_swapped = l_parts[:]
+            l_swapped = ["labels" if p == "images" else p for p in l_swapped]
+            if "/".join(l_swapped[:-1]) == i_dir:
+                score += 40
+
+        # shared suffix components (e.g., train/val/test, subfolders)
+        l_dirs = l_parts[:-1]
+        i_dirs = i_parts[:-1]
+        common_suffix = 0
+        for a, b in zip(reversed(l_dirs), reversed(i_dirs)):
+            if a == b:
+                common_suffix += 1
+            else:
+                break
+        score += 10 * common_suffix
+
+        # slight preference for .jpg/.jpeg
+        ext = os.path.splitext(rel_img)[1].lower()
+        if ext in [".jpg", ".jpeg"]:
+            score += 2
+
+        return score
+
+    def find_matching_image_rel(self, rel_label_path: str) -> Optional[str]:
+        """
+        Robust label->image matching across the entire dataset:
+          - indexes all images once (stem -> rel paths)
+          - picks the best candidate by directory heuristics
+        """
+        stem = os.path.splitext(os.path.basename(rel_label_path))[0].lower()
+        candidates = self.image_index_by_stem.get(stem, [])
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return self._norm_rel(candidates[0])
+
+        best = None
+        best_score = -10**9
+        for rel_img in candidates:
+            sc = self._score_image_candidate(rel_label_path, rel_img)
+            if sc > best_score:
+                best_score = sc
+                best = rel_img
+        return self._norm_rel(best) if best else None
+
+    # ---------- deletion plan helpers ----------
     def candidates_for_op(self, op: 'DeletionOp') -> List[str]:
         target_uid = self.class_order[op.class_index]
         alive_uids = set(self.class_order)
@@ -162,36 +265,9 @@ class YoloDatasetModel:
                 if op.delete_images_too:
                     rel_img = self.label_to_image_rel.get(rel_label)
                     if rel_img:
-                        self.delete_rel_images.add(os.path.normpath(rel_img))
-    """
-    - Reads INPUT dataset.
-    - Holds class edits + deletion plan in-memory.
-    - APPLY writes NEW labels/classes into OUTPUT (INPUT not modified).
-    """
+                        self.delete_rel_images.add(self._norm_rel(rel_img))
 
-    def __init__(self):
-        self.in_root: Optional[str] = None
-        self.out_root: Optional[str] = None
-
-        self.original_classes: List[str] = []
-        self.original_index_to_uid: Dict[int, int] = {}
-        self.uid_to_name: Dict[int, str] = {}
-        self.class_order: List[int] = []
-        self.uid_redirect: Dict[int, int] = {}
-        self.next_uid: int = 1
-        self.loaded: bool = False
-
-        # Index from input
-        self.rel_label_files: List[str] = []
-        self.label_to_classset: Dict[str, Set[int]] = {}
-        self.label_to_box_counts: Dict[str, Dict[int, int]] = {}
-        self.label_to_image_rel: Dict[str, Optional[str]] = {}
-
-        # Deletion plan (affects OUTPUT only)
-        self.delete_rel_labels: Set[str] = set()
-        self.delete_rel_images: Set[str] = set()
-        self.deletion_ops: List[DeletionOp] = []
-
+    # ---------- load / index ----------
     def load_input(self, dataset_root: str) -> None:
         dataset_root = os.path.abspath(dataset_root)
         classes = read_classes_txt(os.path.join(dataset_root, CLASSES_FILENAME))
@@ -215,18 +291,27 @@ class YoloDatasetModel:
         self._build_input_index()
         self.delete_rel_labels.clear()
         self.delete_rel_images.clear()
+        self.deletion_ops.clear()
         self.loaded = True
 
     def _build_input_index(self) -> None:
         if not self.in_root:
             return
+
+        # Build image index once (stem -> list[rel_img])
+        self.image_index_by_stem.clear()
+        for abs_img in iter_image_files(self.in_root):
+            rel_img = self._norm_rel(os.path.relpath(abs_img, self.in_root))
+            stem = os.path.splitext(os.path.basename(rel_img))[0].lower()
+            self.image_index_by_stem.setdefault(stem, []).append(rel_img)
+
         self.rel_label_files = []
         self.label_to_classset.clear()
         self.label_to_box_counts.clear()
         self.label_to_image_rel.clear()
 
         for abs_lf in iter_label_files(self.in_root):
-            rel = os.path.normpath(os.path.relpath(abs_lf, self.in_root))
+            rel = self._norm_rel(os.path.relpath(abs_lf, self.in_root))
             self.rel_label_files.append(rel)
 
             classset: Set[int] = set()
@@ -238,7 +323,7 @@ class YoloDatasetModel:
             except Exception:
                 self.label_to_classset[rel] = set()
                 self.label_to_box_counts[rel] = {}
-                self.label_to_image_rel[rel] = find_matching_image(self.in_root, rel)
+                self.label_to_image_rel[rel] = self.find_matching_image_rel(rel)
                 continue
 
             for ln in lines:
@@ -251,10 +336,11 @@ class YoloDatasetModel:
 
             self.label_to_classset[rel] = classset
             self.label_to_box_counts[rel] = box_counts
-            self.label_to_image_rel[rel] = find_matching_image(self.in_root, rel)
+            self.label_to_image_rel[rel] = self.find_matching_image_rel(rel)
 
         self.rel_label_files.sort()
 
+    # ---------- output setup ----------
     def set_output(self, out_root: str) -> None:
         if not self.loaded:
             raise DatasetError("Load input dataset first.")
@@ -268,6 +354,7 @@ class YoloDatasetModel:
         if os.path.abspath(self.out_root) == os.path.abspath(self.in_root):
             raise DatasetError("Output folder must be different from input folder.")
 
+    # ---------- class editing ----------
     def _resolve_uid(self, uid: int) -> int:
         while uid in self.uid_redirect:
             uid = self.uid_redirect[uid]
@@ -464,13 +551,15 @@ class YoloDatasetModel:
         files_copied = 0
         if copy_non_label_files:
             for p in iter_all_files(self.in_root):
-                rel = os.path.normpath(os.path.relpath(p, self.in_root))
-                rel_lower = rel.replace("\\", "/").lower()
+                rel = self._norm_rel(os.path.relpath(p, self.in_root))
+                rel_lower = rel.lower()
 
                 if rel_lower == CLASSES_FILENAME:
                     continue
                 if rel_lower.endswith(".txt") and rel_lower != CLASSES_FILENAME:
                     continue
+
+                # Skip any image explicitly in the deletion plan
                 if rel in self.delete_rel_images:
                     continue
 
@@ -523,6 +612,8 @@ class YoloDatasetModel:
                 out_lines.append(format_label_line(new_cid, x, y, w, h))
                 boxes_written += 1
 
+            # If no lines remain, do not write this label file.
+            # Note: this can leave "background" images by design if you did not explicitly choose to delete images too.
             if not out_lines:
                 continue
 
@@ -537,13 +628,11 @@ class YoloDatasetModel:
         return label_files_written, label_lines_removed, boxes_written, files_copied, samples_skipped, warnings
 
 
-
 # --- PDF Export ---
 def export_stats_pdf(model: 'YoloDatasetModel', pdf_path: str) -> None:
     box_by_idx, single_by_idx, overlap_by_idx, total_boxes, total_files, warnings = model.compute_stats()
     any_by_idx, overlap_matrix = model.compute_full_image_stats()
     classes = model.get_classes()
-    n = len(classes)
 
     styles = getSampleStyleSheet()
     doc = SimpleDocTemplate(pdf_path, pagesize=A4)
@@ -578,6 +667,14 @@ def export_stats_pdf(model: 'YoloDatasetModel', pdf_path: str) -> None:
     ]))
 
     story.append(table)
+
+    if warnings:
+        story.append(Spacer(1, 12))
+        story.append(Paragraph("<b>Warnings (first 30):</b>", styles["Normal"]))
+        story.append(Spacer(1, 6))
+        for w in warnings[:30]:
+            story.append(Paragraph(f"- {w}", styles["Normal"]))
+
     doc.build(story)
 
 
@@ -683,12 +780,11 @@ class ManageSamplesDialog(QDialog):
 
         self.rb_overlap_specific.toggled.connect(self._update_overlap_enabled)
         self._update_overlap_enabled()
+
     def _refresh_overlap_info(self):
-        # Always show "how many images contain this class"
         any_by_idx, overlap_matrix = self.model.compute_full_image_stats()
         base_any = any_by_idx.get(self.class_index, 0)
 
-        # If overlap-specific is selected, show pairwise overlap too
         if self.rb_overlap_specific.isChecked() and self.cmb_overlap.currentIndex() >= 0:
             other_idx = int(self.cmb_overlap.currentData())
             pair = overlap_matrix[self.class_index][other_idx]
@@ -699,7 +795,6 @@ class ManageSamplesDialog(QDialog):
         else:
             self.lbl_overlap_info.setText(f"Any images with this class: {base_any}")
 
-        # Also show how many candidates match the CURRENT mode
         self.lbl_candidates.setText(f"Candidates for current filter: {len(self._compute_candidates())}")
 
     def _update_overlap_enabled(self):
@@ -915,7 +1010,6 @@ class MainWindow(QMainWindow):
         info.addWidget(self.lbl_delplan)
         info.addStretch(1)
 
-        # Buttons next to each other (as requested)
         self.btn_refresh = QPushButton("Refresh Stats")
         self.btn_refresh.clicked.connect(self.refresh_stats)
         info.addWidget(self.btn_refresh)
@@ -938,7 +1032,6 @@ class MainWindow(QMainWindow):
         self.lbl_warn.setTextInteractionFlags(Qt.TextSelectableByMouse)
         gb_warn_lay.addWidget(self.lbl_warn)
 
-        # --- Deletion plan panel ---
         gb_plan = QGroupBox("Deletion plan (summary)")
         gb_plan_lay = QVBoxLayout(gb_plan)
         right_lay.addWidget(gb_plan, 0)
@@ -973,13 +1066,13 @@ class MainWindow(QMainWindow):
             self.btn_plan_clear, self.btn_plan_cancel, self.plan_table
         ]:
             w.setEnabled(on)
+
     def on_plan_cancel_selected(self):
         row = self.plan_table.currentRow()
         if row < 0 or row >= len(self.model.deletion_ops):
             QMessageBox.information(self, "Plan", "Select one order to cancel.")
             return
 
-        op = self.model.deletion_ops[row]
         reply = QMessageBox.question(
             self, "Cancel order",
             "Cancel the selected order?\n\n"
@@ -1037,8 +1130,6 @@ class MainWindow(QMainWindow):
     def refresh_deletion_plan_view(self):
         ops = self.model.deletion_ops
         self.plan_table.setRowCount(len(ops))
-
-        # to resolve names for display
         classes = {idx: name for idx, name in self.model.get_classes()}
 
         def mode_pretty(m: str) -> str:
@@ -1065,31 +1156,6 @@ class MainWindow(QMainWindow):
     def on_plan_clear(self):
         self.model.clear_deletion_plan()
         self.refresh_stats()
-
-    def on_plan_remove_selected(self):
-        removed_labels = 0
-        removed_images = 0
-
-        # Remove selected labels
-        for it in self.list_plan_labels.selectedItems():
-            rel = it.text()
-            if rel in self.model.delete_rel_labels:
-                self.model.delete_rel_labels.remove(rel)
-                removed_labels += 1
-
-        # Remove selected images
-        for it in self.list_plan_images.selectedItems():
-            rel = it.text()
-            if rel in self.model.delete_rel_images:
-                self.model.delete_rel_images.remove(rel)
-                removed_images += 1
-
-        if removed_labels == 0 and removed_images == 0:
-            QMessageBox.information(self, "Plan", "Nothing selected.")
-            return
-
-        self.refresh_stats()
-        QMessageBox.information(self, "Plan", f"Removed: {removed_labels} labels, {removed_images} images")
 
     def on_select_input(self):
         folder = QFileDialog.getExistingDirectory(self, "Select INPUT YOLO dataset folder")
@@ -1138,7 +1204,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "PDF Error", str(e))
 
-    # ----- class actions -----
     def on_rename(self):
         idxs = self.selected_indices()
         if len(idxs) != 1:
@@ -1282,6 +1347,7 @@ class MainWindow(QMainWindow):
                 f"Annotation lines removed (deleted classes): {removed}\n"
                 f"Boxes written: {boxes_written}\n"
                 f"Non-label files copied: {files_copied}\n"
+                f"Planned image deletions (skipped copy): {len(self.model.delete_rel_images)}\n"
             )
             if warnings:
                 msg += f"\nWarnings: {len(warnings)}\n"
